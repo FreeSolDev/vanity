@@ -1,9 +1,9 @@
 # Vanity Keypair Generator Service
 # Runs solana-vanity in a container with a simple HTTP API
 
-FROM rust:1.75-slim as builder
+FROM rustlang/rust:nightly-slim as builder
 
-# Install solana-vanity
+# Install solana-vanity (requires Rust edition 2024 / nightly)
 RUN cargo install solana-vanity
 
 # Runtime image
