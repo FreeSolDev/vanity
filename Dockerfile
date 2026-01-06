@@ -3,6 +3,12 @@
 
 FROM rustlang/rust:nightly-slim as builder
 
+# Install build dependencies
+RUN apt-get update && apt-get install -y \
+    pkg-config \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
 # Install solana-vanity (requires Rust edition 2024 / nightly)
 RUN cargo install solana-vanity
 
