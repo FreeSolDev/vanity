@@ -18,8 +18,9 @@ FROM node:24-slim
 # Copy solana-vanity binary from builder
 COPY --from=builder /usr/local/cargo/bin/solana-vanity /usr/local/bin/solana-vanity
 
-# Create app directory
+# Create app directory and volume mount point
 WORKDIR /app
+RUN mkdir -p /data/jobs
 
 # Copy package files
 COPY package*.json ./
