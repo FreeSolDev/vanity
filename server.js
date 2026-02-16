@@ -23,7 +23,7 @@ const app = express();
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
-const MAX_SUFFIX_LENGTH = parseInt(process.env.MAX_SUFFIX_LENGTH) || 5;
+const MAX_SUFFIX_LENGTH = 4;
 const TIMEOUT_MS = parseInt(process.env.TIMEOUT_MS) || 120000;
 const JOBS_DIR = process.env.JOBS_DIR || '/data/jobs';
 const MAX_CONCURRENT = parseInt(process.env.MAX_CONCURRENT) || 1;
