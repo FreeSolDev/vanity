@@ -255,6 +255,11 @@ function validateSuffix(suffix) {
   if (!/^[a-zA-Z0-9]+$/.test(suffix)) {
     return 'Suffix must be alphanumeric';
   }
+  // Base58 excludes 0, O, I, l — Solana addresses can never contain these
+  const invalid = suffix.match(/[0OIl]/g);
+  if (invalid) {
+    return `Suffix contains invalid base58 character(s): ${[...new Set(invalid)].join(', ')}. Solana addresses cannot contain 0, O, I, or l.`;
+  }
   if (suffix.length > MAX_SUFFIX_LENGTH) {
     return `Suffix too long. Max ${MAX_SUFFIX_LENGTH} chars (longer = exponentially slower)`;
   }
