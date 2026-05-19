@@ -1,0 +1,25 @@
+[package]
+name = "solana-vanity"
+version = "0.2.0"
+edition = "2021"
+
+[[bin]]
+name = "solana-vanity"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[dependencies]
+curve25519-dalek = "3"
+sha2 = "0.9"
+rand_chacha = "0.3"
+rand_core = "0.6"
+getrandom = "0.2"
+rayon = "1"
+clap = { version = "4", features = ["derive"] }
+bs58 = "0.4"
+ed25519-dalek = "1"
