@@ -9,8 +9,12 @@ RUN apt-get update && apt-get install -y \
     libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Install solana-vanity (requires Rust edition 2024 / nightly)
-RUN cargo install solana-vanity
+# Build the optimized vanity grinder (fixed-base table + ChaCha8 RNG +
+# trailing-base58 early reject) — replaces the naive `solana-vanity`
+# crate. Same binary name/path/CLI so server.js + the COPY below are
+# untouched.
+COPY grinder/ /build/
+RUN cd /build && cargo install --path .
 
 # Runtime image
 FROM node:24-slim
