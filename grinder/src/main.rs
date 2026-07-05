@@ -3,30 +3,29 @@
 //! FreeSolDev/vanity server.js parses (`Address:` / `Private Key (Base58):`
 //! / `Time elapsed:`), so the HTTP service is untouched.
 //!
-//! Why it's faster on the SAME cores (no point-addition trick — Solana
-//! keypairs are seed-based, so we must grind real 32-byte seeds and derive
-//! the pubkey per RFC-8032):
-//!   1. ChaCha8 CSPRNG seeded ONCE per worker (vs OsRng syscall per attempt).
-//!   2. Fixed-base scalar mult via ED25519_BASEPOINT_TABLE (vs the generic
-//!      mult inside solana-sdk's Keypair::new()), no per-attempt struct/alloc.
-//!   3. Trailing-base58-digit early reject: the last k base58 chars are just
-//!      k cheap divmod-by-58 steps on the 256-bit pubkey — reject ~57/58 of
-//!      attempts WITHOUT a full base58 encode + String alloc.
-//! Output keypair is verified once (ed25519-dalek v1, the lib solana-sdk
-//! uses) before printing — a wrong seed→pub can never ship.
+//! v0.3: the hot loop lives in `engine.rs` — a batched vartime comb
+//! (32 direct-indexed point adds, no doublings, no constant-time scans)
+//! with Montgomery batch inversion for compression and a residue-based
+//! suffix filter. Seed-correct as before: real 32-byte seeds, pubkey per
+//! RFC-8032 (there is no scalar-increment shortcut for Solana's seed-based
+//! keypairs). This file keeps the CLI, the dalek reference derivation
+//! (`pubkey_from_seed`, now the self-test oracle and >8-char fallback) and
+//! the final ed25519-dalek verify gate — a wrong seed→pub can never ship.
+//! New flags: `--any-case` (case-insensitive match, ~16x less work for
+//! letter suffixes) and `--bench N` (measure keys/s, emit no keys).
+
+mod engine;
 
 use clap::Parser;
 use curve25519_dalek::{constants::ED25519_BASEPOINT_TABLE, scalar::Scalar};
+use engine::{Precomp, SuffixFilter, B58, BATCH};
 use rand_chacha::ChaCha8Rng;
 use rand_core::{RngCore, SeedableRng};
 use rayon::prelude::*;
 use sha2::{Digest, Sha512};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
-
-const B58: &[u8; 58] =
-    b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
 #[derive(Parser)]
 #[command(about = "Optimized Solana vanity address generator")]
@@ -37,6 +36,13 @@ struct Args {
     /// Worker threads (default: cgroup-aware available parallelism)
     #[arg(short, long, default_value_t = default_threads())]
     threads: usize,
+    /// Case-insensitive suffix match — far less work for letter suffixes;
+    /// the found address may differ from the request in letter case
+    #[arg(long)]
+    any_case: bool,
+    /// Benchmark: derive N keys, print the keys/s rate, emit no keypair
+    #[arg(long, default_value_t = 0)]
+    bench: u64,
 }
 
 fn default_threads() -> usize {
@@ -82,13 +88,29 @@ fn ends_with_b58(pk: &[u8; 32], suffix: &[u8]) -> bool {
 fn main() {
     let args = Args::parse();
     let suffix = args.suffix.into_bytes();
-    if suffix.is_empty() || !suffix.iter().all(|c| B58.contains(c)) {
-        eprintln!("Error: suffix must be non-empty valid base58 chars");
+    let any_case = args.any_case;
+    if let Err(e) = engine::validate_suffix(&suffix, any_case) {
+        eprintln!("Error: {}", e);
         std::process::exit(2);
     }
     let nthreads = args.threads.max(1);
-    println!("Searching for vanity suffix: \"{}\"", String::from_utf8_lossy(&suffix));
-    println!("Using {} threads...", nthreads);
+
+    // Fast path (≤8 chars — i.e. anything practically grindable): batched
+    // comb engine, self-tested against the dalek oracle at every start.
+    let engine_parts = if suffix.len() <= 8 {
+        let pre = Precomp::new();
+        engine::self_test(&pre, pubkey_from_seed);
+        match SuffixFilter::new(&suffix, any_case) {
+            Ok(filter) => Some((pre, filter)),
+            Err(e) => {
+                eprintln!("Error: {}", e);
+                std::process::exit(2);
+            }
+        }
+    } else {
+        None
+    };
+    let ep = engine_parts.as_ref();
 
     let found = AtomicBool::new(false);
     let result: Mutex<Option<([u8; 32], [u8; 32])>> = Mutex::new(None);
@@ -98,6 +120,57 @@ fn main() {
         .num_threads(nthreads)
         .build()
         .expect("rayon pool");
+
+    if args.bench > 0 {
+        let (pre, filter) = ep.expect("--bench supports suffixes up to 8 chars");
+        let total = AtomicU64::new(0);
+        let bench_n = args.bench;
+        let bstart = Instant::now();
+        pool.install(|| {
+            (0..nthreads).into_par_iter().for_each(|tid| {
+                let mut os = [0u8; 32];
+                getrandom::getrandom(&mut os).expect("os rng");
+                os[0] ^= tid as u8;
+                os[1] ^= (tid >> 8) as u8;
+                let mut rng = ChaCha8Rng::from_seed(os);
+                let mut seeds = [[0u8; 32]; BATCH];
+                let mut pks = [[0u8; 32]; BATCH];
+                loop {
+                    rng.fill_bytes(seeds.as_flattened_mut());
+                    engine::derive_pubkeys(pre, &seeds, &mut pks);
+                    let mut hits = 0u32;
+                    for pk in &pks {
+                        if filter.matches(pk) {
+                            hits += 1;
+                        }
+                    }
+                    std::hint::black_box(hits);
+                    let t = total.fetch_add(BATCH as u64, Ordering::Relaxed) + BATCH as u64;
+                    if t >= bench_n {
+                        break;
+                    }
+                }
+            });
+        });
+        let elapsed = bstart.elapsed().as_secs_f64();
+        let n = total.load(Ordering::Relaxed) as f64;
+        println!(
+            "Benchmark: {:.0} attempts in {:.3}s = {:.0} keys/s ({} threads)",
+            n,
+            elapsed,
+            n / elapsed,
+            nthreads
+        );
+        return;
+    }
+
+    println!(
+        "Searching for vanity suffix: \"{}\"{}",
+        String::from_utf8_lossy(&suffix),
+        if any_case { " (case-insensitive)" } else { "" }
+    );
+    println!("Using {} threads...", nthreads);
+
     pool.install(|| {
         (0..nthreads).into_par_iter().for_each(|tid| {
             let mut os = [0u8; 32];
@@ -105,15 +178,39 @@ fn main() {
             os[0] ^= tid as u8;
             os[1] ^= (tid >> 8) as u8;
             let mut rng = ChaCha8Rng::from_seed(os);
-            let mut seed = [0u8; 32];
-            while !found.load(Ordering::Relaxed) {
-                rng.fill_bytes(&mut seed);
-                let pk = pubkey_from_seed(&seed);
-                if ends_with_b58(&pk, &suffix) {
-                    if !found.swap(true, Ordering::SeqCst) {
-                        *result.lock().unwrap() = Some((seed, pk));
+            if let Some((pre, filter)) = ep {
+                let mut seeds = [[0u8; 32]; BATCH];
+                let mut pks = [[0u8; 32]; BATCH];
+                while !found.load(Ordering::Relaxed) {
+                    rng.fill_bytes(seeds.as_flattened_mut());
+                    engine::derive_pubkeys(pre, &seeds, &mut pks);
+                    for j in 0..BATCH {
+                        if filter.matches(&pks[j]) {
+                            if !found.swap(true, Ordering::SeqCst) {
+                                *result.lock().unwrap() = Some((seeds[j], pks[j]));
+                            }
+                            return;
+                        }
                     }
-                    return;
+                }
+            } else {
+                // Fallback (suffix >8 chars — astronomically infeasible to
+                // find, but keep the original behavior): per-attempt path.
+                let mut seed = [0u8; 32];
+                while !found.load(Ordering::Relaxed) {
+                    rng.fill_bytes(&mut seed);
+                    let pk = pubkey_from_seed(&seed);
+                    let hit = if any_case {
+                        engine::reference_matches(&pk, &suffix, true)
+                    } else {
+                        ends_with_b58(&pk, &suffix)
+                    };
+                    if hit {
+                        if !found.swap(true, Ordering::SeqCst) {
+                            *result.lock().unwrap() = Some((seed, pk));
+                        }
+                        return;
+                    }
                 }
             }
         });

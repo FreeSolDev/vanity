@@ -23,7 +23,7 @@ const app = express();
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
-const MAX_SUFFIX_LENGTH = 4;
+const MAX_SUFFIX_LENGTH = parseInt(process.env.MAX_SUFFIX_LENGTH) || 4;
 const TIMEOUT_MS = parseInt(process.env.TIMEOUT_MS) || 120000;
 const JOBS_DIR = process.env.JOBS_DIR || '/data/jobs';
 const MAX_CONCURRENT = parseInt(process.env.MAX_CONCURRENT) || 1;
@@ -88,12 +88,14 @@ async function drain() {
 
 // --- Keypair generation ---
 
-function generateKeypair(suffix, timeoutMs) {
+function generateKeypair(suffix, timeoutMs, caseInsensitive = false) {
   return new Promise((resolve, reject) => {
     const startTime = Date.now();
     let killed = false;
 
-    const proc = spawn('solana-vanity', ['--suffix', suffix], {
+    const grinderArgs = ['--suffix', suffix];
+    if (caseInsensitive) grinderArgs.push('--any-case');
+    const proc = spawn('solana-vanity', grinderArgs, {
       stdio: ['ignore', 'pipe', 'pipe']
     });
 
@@ -180,11 +182,11 @@ async function runJob(jobId) {
   job.startedAt = new Date().toISOString();
   await saveJob(job);
 
-  console.log(`[${new Date().toISOString()}] Job ${jobId}: generating ${job.count} keypair(s) with suffix "${job.suffix}"`);
+  console.log(`[${new Date().toISOString()}] Job ${jobId}: generating ${job.count} keypair(s) with suffix "${job.suffix}"${job.caseInsensitive ? ' (case-insensitive)' : ''}`);
 
   try {
     for (let i = 0; i < job.count; i++) {
-      const keypair = await generateKeypair(job.suffix, job.timeout);
+      const keypair = await generateKeypair(job.suffix, job.timeout, job.caseInsensitive === true);
       job.keypairs.push(keypair);
       job.progress.completed = i + 1;
       await saveJob(job);
@@ -248,17 +250,25 @@ await recoverJobs();
 
 // --- Shared validation ---
 
-function validateSuffix(suffix) {
+function validateSuffix(suffix, caseInsensitive = false) {
   if (!suffix || typeof suffix !== 'string') {
     return 'Missing or invalid suffix';
   }
   if (!/^[a-zA-Z0-9]+$/.test(suffix)) {
     return 'Suffix must be alphanumeric';
   }
-  // Base58 excludes 0, O, I, l — Solana addresses can never contain these
-  const invalid = suffix.match(/[0OIl]/g);
-  if (invalid) {
-    return `Suffix contains invalid base58 character(s): ${[...new Set(invalid)].join(', ')}. Solana addresses cannot contain 0, O, I, or l.`;
+  if (caseInsensitive) {
+    // Case-insensitive: O/I/l fold onto valid base58 chars; only 0 can
+    // never appear in an address in any case.
+    if (suffix.includes('0')) {
+      return 'Suffix contains 0, which never appears in a base58 address (even case-insensitively).';
+    }
+  } else {
+    // Base58 excludes 0, O, I, l — Solana addresses can never contain these
+    const invalid = suffix.match(/[0OIl]/g);
+    if (invalid) {
+      return `Suffix contains invalid base58 character(s): ${[...new Set(invalid)].join(', ')}. Solana addresses cannot contain 0, O, I, or l. Tip: "caseInsensitive": true accepts O, I and l (matched as o, i, L).`;
+    }
   }
   if (suffix.length > MAX_SUFFIX_LENGTH) {
     return `Suffix too long. Max ${MAX_SUFFIX_LENGTH} chars (longer = exponentially slower)`;
@@ -279,22 +289,23 @@ app.get('/health', (_req, res) => {
 
 // Synchronous generate (original behavior)
 app.post('/generate', async (req, res) => {
-  const { suffix, count = 1, timeout = TIMEOUT_MS } = req.body;
+  const { suffix, count = 1, timeout = TIMEOUT_MS, caseInsensitive = false } = req.body;
+  const ci = caseInsensitive === true;
 
-  const error = validateSuffix(suffix);
+  const error = validateSuffix(suffix, ci);
   if (error) return res.status(400).json({ error });
 
   const requestedCount = Math.min(Math.max(1, parseInt(count)), 10);
   const effectiveTimeout = Math.min(timeout, 300000);
 
-  console.log(`[${new Date().toISOString()}] Generating ${requestedCount} keypair(s) with suffix "${suffix}"`);
+  console.log(`[${new Date().toISOString()}] Generating ${requestedCount} keypair(s) with suffix "${suffix}"${ci ? ' (case-insensitive)' : ''}`);
 
   try {
     const results = [];
     const startTime = Date.now();
 
     for (let i = 0; i < requestedCount; i++) {
-      const keypair = await generateKeypair(suffix, effectiveTimeout);
+      const keypair = await generateKeypair(suffix, effectiveTimeout, ci);
       results.push(keypair);
     }
 
@@ -302,6 +313,7 @@ app.post('/generate', async (req, res) => {
       success: true,
       count: results.length,
       suffix,
+      caseInsensitive: ci,
       totalTimeMs: Date.now() - startTime,
       keypairs: results
     });
@@ -316,9 +328,10 @@ app.post('/generate', async (req, res) => {
 
 // Submit an async job
 app.post('/jobs', async (req, res) => {
-  const { suffix, count = 1, timeout = TIMEOUT_MS } = req.body;
+  const { suffix, count = 1, timeout = TIMEOUT_MS, caseInsensitive = false } = req.body;
+  const ci = caseInsensitive === true;
 
-  const error = validateSuffix(suffix);
+  const error = validateSuffix(suffix, ci);
   if (error) return res.status(400).json({ error });
 
   // Rate limit: reject if queue is full
@@ -335,6 +348,7 @@ app.post('/jobs', async (req, res) => {
   const job = {
     id: randomUUID(),
     suffix,
+    caseInsensitive: ci,
     count: requestedCount,
     timeout: effectiveTimeout,
     status: 'queued',
@@ -356,6 +370,7 @@ app.post('/jobs', async (req, res) => {
     status: job.status,
     queuePosition: queuePosition(job.id),
     suffix: job.suffix,
+    caseInsensitive: job.caseInsensitive,
     count: job.count,
     message: `Job queued. Poll GET /jobs/${job.id} for results.`
   });
@@ -391,6 +406,7 @@ app.get('/jobs', async (_req, res) => {
         jobs.push({
           id: job.id,
           suffix: job.suffix,
+          caseInsensitive: job.caseInsensitive === true,
           status: job.status,
           progress: job.progress,
           queuePosition: job.status === 'queued' ? queuePosition(job.id) : null,

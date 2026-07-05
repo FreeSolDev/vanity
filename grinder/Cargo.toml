@@ -1,6 +1,6 @@
 [package]
 name = "solana-vanity"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 
 [[bin]]
@@ -14,6 +14,7 @@ codegen-units = 1
 panic = "abort"
 
 [dependencies]
+fiat-crypto = "0.2"
 curve25519-dalek = "3"
 sha2 = "0.9"
 rand_chacha = "0.3"

@@ -1,6 +1,6 @@
 # Vanity Generator API Guide
 
-Base URL: `https://longcagenerator.up.railway.app`
+Base URL: `http://<your-host>:3000` (reference deploy is **internal-only** — e.g. `http://vanity:3000` on the private network; the old Railway URL is defunct)
 
 ## Quick Start
 
@@ -9,7 +9,7 @@ Base URL: `https://longcagenerator.up.railway.app`
 Use the sync endpoint — it blocks until done and returns the keys directly.
 
 ```bash
-curl -X POST https://longcagenerator.up.railway.app/generate \
+curl -X POST http://vanity:3000/generate \
   -H "Content-Type: application/json" \
   -d '{"suffix": "vin"}'
 ```
@@ -20,7 +20,7 @@ Use the async jobs endpoint — it returns a job ID instantly, then you poll for
 
 ```bash
 # 1. Submit the job
-curl -X POST https://longcagenerator.up.railway.app/jobs \
+curl -X POST http://vanity:3000/jobs \
   -H "Content-Type: application/json" \
   -d '{"suffix": "pump"}'
 
@@ -33,7 +33,7 @@ curl -X POST https://longcagenerator.up.railway.app/jobs \
 # }
 
 # 2. Poll for results (use the jobId from above)
-curl https://longcagenerator.up.railway.app/jobs/6c9de77c-7bad-4e5f-8115-59ed449b2274
+curl http://vanity:3000/jobs/6c9de77c-7bad-4e5f-8115-59ed449b2274
 
 # When done:
 # {
@@ -55,15 +55,19 @@ Blocks until all keypairs are generated. Best for short suffixes that take a few
 {
   "suffix": "vin",
   "count": 3,
-  "timeout": 60000
+  "timeout": 60000,
+  "caseInsensitive": false
 }
 ```
 
 | Field | Required | Default | Description |
 |-------|----------|---------|-------------|
-| `suffix` | Yes | — | Alphanumeric string, max 5 chars |
+| `suffix` | Yes | — | Alphanumeric string, max 4 chars (env `MAX_SUFFIX_LENGTH`) |
 | `count` | No | 1 | Number of keypairs to generate (1-10) |
 | `timeout` | No | 120000 | Timeout per keypair in ms (max 300000) |
+| `caseInsensitive` | No | false | Match the suffix in any letter case — see below |
+
+**`caseInsensitive: true` is the fast mode.** Each letter can match 2 ways (`p` or `P`), so a 4-letter suffix needs ~16× fewer attempts — typically seconds instead of minutes. The found address may differ in case from what you asked for (request `PUMP`, get `...RoPUmp`). Bonus: `O`, `I` and `l` — normally impossible in base58 — are accepted and matched as `o`, `i`, `L`. Only `0` can never appear. The response echoes `caseInsensitive` so you know which mode produced it.
 
 **Response (`200`):**
 ```json
@@ -71,6 +75,7 @@ Blocks until all keypairs are generated. Best for short suffixes that take a few
   "success": true,
   "count": 3,
   "suffix": "vin",
+  "caseInsensitive": false,
   "totalTimeMs": 8500,
   "keypairs": [
     {
@@ -94,7 +99,8 @@ Returns immediately with a job ID. The job enters a queue and runs in the backgr
 {
   "suffix": "pump",
   "count": 1,
-  "timeout": 300000
+  "timeout": 300000,
+  "caseInsensitive": true
 }
 ```
 
@@ -107,6 +113,7 @@ Same fields as `/generate`.
   "status": "queued",
   "queuePosition": 1,
   "suffix": "pump",
+  "caseInsensitive": true,
   "count": 1,
   "message": "Job queued. Poll GET /jobs/6c9de77c-... for results."
 }
@@ -242,7 +249,7 @@ Returns a summary of all jobs. Secret keys are **not** included in this view.
 ```javascript
 async function generateVanity(suffix) {
   // Submit job
-  const { jobId } = await fetch('https://longcagenerator.up.railway.app/jobs', {
+  const { jobId } = await fetch('http://vanity:3000/jobs', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ suffix })
@@ -250,7 +257,7 @@ async function generateVanity(suffix) {
 
   // Poll until done
   while (true) {
-    const job = await fetch(`https://longcagenerator.up.railway.app/jobs/${jobId}`)
+    const job = await fetch(`http://vanity:3000/jobs/${jobId}`)
       .then(r => r.json());
 
     if (job.status === 'complete') return job.keypairs;
@@ -269,10 +276,12 @@ console.log(keys[0].publicKey); // "...pump"
 
 ## Expected Generation Times
 
-| Suffix Length | Example | Approx. Time | Recommended Endpoint |
-|---------------|---------|-------------|---------------------|
-| 1-2 chars | `ab` | < 1s | `POST /generate` |
-| 3 chars | `vin` | 0.5-2s | `POST /generate` |
-| 4 chars | `pump` | 2-90s | `POST /jobs` |
-| 5 chars | `money` | 30s-5min | `POST /jobs` |
-| 6+ chars | — | Too slow | Not recommended |
+Measured with the v0.3 batched grinder on a 6-core/12-thread desktop (~425k keys/s). A small 2-vCPU deploy is roughly 4-6× slower; vanity search is probabilistic, so expect ±3-5× swing per run.
+
+| Suffix Length | Example | Exact case | `caseInsensitive` (letters) | Recommended Endpoint |
+|---------------|---------|-----------|------------------------------|---------------------|
+| 1-2 chars | `ab` | < 1s | < 1s | `POST /generate` |
+| 3 chars | `vin` | ~0.5s | < 0.5s | `POST /generate` |
+| 4 chars | `pump` | ~10-60s | **~1-3s** | `POST /jobs` (exact) / either (CI) |
+| 5 chars | `money` | ~10-45min | ~1-3min | `POST /jobs` |
+| 6+ chars | — | days+ | hours | Not recommended on CPU |
