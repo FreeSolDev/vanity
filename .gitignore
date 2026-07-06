@@ -1,3 +1,11 @@
 keys/
 CLAUDE.md
 node_modules/
+
+# Rust build output
+grinder/target/
+
+# Claude IDE / local tooling
+.claude/
+.claude-ide/
+.claudeignore
